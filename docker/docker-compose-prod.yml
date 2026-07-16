@@ -1,0 +1,124 @@
+version: "3.8"
+
+services:
+
+  web:
+    image: nginx:alpine
+    container_name: minivault-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - web-static:/usr/share/nginx/html:ro
+      - web-storage:/usr/share/nginx/html/uploads
+    networks:
+      - minivault-network
+
+  minivault-db:
+    image: postgres:16-alpine
+    container_name: minivault-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: minivault_db
+      POSTGRES_USER: minivault_user
+      POSTGRES_PASSWORD: ${MINIVAULT_DB_PASSWORD}
+    volumes:
+      - minivault-db-data:/var/lib/postgresql/data
+    networks:
+      - minivault-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U minivault_user -d minivault_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  target-db:
+    image: postgres:16-alpine
+    container_name: minivault-target-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: target_db
+      POSTGRES_USER: target_user
+      POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD}
+    volumes:
+      - target-db-data:/var/lib/postgresql/data
+    networks:
+      - minivault-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U target_user -d target_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minivault:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: minivault
+    restart: unless-stopped
+    environment:
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://minivault-db:5432/minivault_db
+      SPRING_DATASOURCE_USERNAME: minivault_user
+      SPRING_DATASOURCE_PASSWORD: ${MINIVAULT_DB_PASSWORD}
+      BACKUP_API_KEY: ${BACKUP_API_KEY}
+      OUTPUT_DIR: /app/backups
+      OUTPUT_TEMP_DIR: /app/temp
+      OUTPUT_STORAGE_TYPE: ${OUTPUT_STORAGE_TYPE:-LOCAL}
+      OUTPUT_STORAGE_ENDPOINT: ${OUTPUT_STORAGE_ENDPOINT}
+      OUTPUT_STORAGE_BUCKET: ${OUTPUT_STORAGE_BUCKET}
+      OUTPUT_STORAGE_ACCESS_KEY: ${OUTPUT_STORAGE_ACCESS_KEY}
+      OUTPUT_STORAGE_SECRET_KEY: ${OUTPUT_STORAGE_SECRET_KEY}
+      OUTPUT_STORAGE_REGION: ${OUTPUT_STORAGE_REGION}
+      OUTPUT_STORAGE_PATH_STYLE: ${OUTPUT_STORAGE_PATH_STYLE:-true}
+      BACKUP_SCHEDULE_ENABLED: "true"
+      BACKUP_SCHEDULE_CRON: "${BACKUP_SCHEDULE_CRON:-0 0 2 * * ?}"
+      SCHEDULED_BACKUP_DB_TYPE: postgresql
+      SCHEDULED_BACKUP_DB_HOST: target-db
+      SCHEDULED_BACKUP_DB_PORT: "${SCHEDULED_BACKUP_DB_PORT:-5432}"
+      SCHEDULED_BACKUP_DB_NAME: target_db
+      SCHEDULED_BACKUP_DB_USER: target_user
+      SCHEDULED_BACKUP_DB_PASSWORD: ${TARGET_DB_PASSWORD}
+      ORIGIN_STORAGE_TYPE: ${ORIGIN_STORAGE_TYPE:-LOCAL}
+      ORIGIN_STORAGE_LOCAL_PATH: ${ORIGIN_STORAGE_LOCAL_PATH:-/data/storage}
+      ORIGIN_STORAGE_ENDPOINT: ${ORIGIN_STORAGE_ENDPOINT}
+      ORIGIN_STORAGE_BUCKET: ${ORIGIN_STORAGE_BUCKET}
+      ORIGIN_STORAGE_ACCESS_KEY: ${ORIGIN_STORAGE_ACCESS_KEY}
+      ORIGIN_STORAGE_SECRET_KEY: ${ORIGIN_STORAGE_SECRET_KEY}
+      ORIGIN_STORAGE_REGION: ${ORIGIN_STORAGE_REGION}
+      ORIGIN_STORAGE_PATH_STYLE: ${ORIGIN_STORAGE_PATH_STYLE:-true}
+      NOTIFICATION_ENABLED: "${NOTIFICATION_ENABLED:-false}"
+      NOTIFICATION_MAIL_HOST: ${NOTIFICATION_MAIL_HOST}
+      NOTIFICATION_MAIL_PORT: "${NOTIFICATION_MAIL_PORT:-587}"
+      NOTIFICATION_MAIL_USERNAME: ${NOTIFICATION_MAIL_USERNAME}
+      NOTIFICATION_MAIL_PASSWORD: ${NOTIFICATION_MAIL_PASSWORD}
+      NOTIFICATION_FROM: ${NOTIFICATION_FROM:-minivault@localhost}
+      NOTIFICATION_TO: ${NOTIFICATION_TO:-admin@localhost}
+      NOTIFICATION_ON_SUCCESS: "${NOTIFICATION_ON_SUCCESS:-false}"
+      NOTIFICATION_ON_FAILURE: "${NOTIFICATION_ON_FAILURE:-true}"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${MINIVAULT_PORT:-8081}:8081"
+    volumes:
+      - minivault-backup-data:/app/backups
+      - minivault-backup-temp:/app/temp
+      - web-storage:/data/storage:ro
+    depends_on:
+      minivault-db:
+        condition: service_healthy
+      target-db:
+        condition: service_healthy
+    networks:
+      - minivault-network
+
+networks:
+  minivault-network:
+    driver: bridge
+
+volumes:
+  minivault-db-data:
+  target-db-data:
+  minivault-backup-data:
+  minivault-backup-temp:
+  web-static:
+  web-storage:
