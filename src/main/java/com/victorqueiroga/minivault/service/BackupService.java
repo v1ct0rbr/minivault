@@ -23,13 +23,21 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.Stream;
 
 @Service
 public class BackupService {
 
     private static final Logger log = LoggerFactory.getLogger(BackupService.class);
+    private static final String SNAPSHOTS_DIR_NAME = "__snapshots__";
 
     private final BackupRepository backupRepository;
     private final BackupHistoryRepository historyRepository;
@@ -47,6 +55,9 @@ public class BackupService {
 
     @Value("${backup.temp.dir}")
     private String tempDir;
+
+    @Value("${backup.storage.snapshots.dir:}")
+    private String storageSnapshotsDir;
 
     public BackupService(BackupRepository backupRepository,
                          BackupHistoryRepository historyRepository,
@@ -93,7 +104,11 @@ public class BackupService {
             if (request.getOriginStorage() != null) {
                 addHistory(backup.getId(), "STORAGE", BackupStatus.IN_PROGRESS,
                         "Collecting origin storage files");
-                collectOriginStorage(request.getOriginStorage(), workDir);
+                LocalDateTime lastBackupTime = backupRepository
+                        .findTopByStatusOrderByCompletedAtDesc(BackupStatus.COMPLETED)
+                        .map(Backup::getCompletedAt)
+                        .orElse(null);
+                collectOriginStorage(request.getOriginStorage(), workDir, backup.getId(), lastBackupTime);
             }
 
             addHistory(backup.getId(), "COMPRESSING", BackupStatus.IN_PROGRESS, "Creating ZIP archive");
@@ -126,6 +141,7 @@ public class BackupService {
 
         } catch (Exception e) {
             log.error("Backup failed: {}", e.getMessage(), e);
+            cleanupSnapshotDir(backup.getId());
             backup.setStatus(BackupStatus.FAILED);
             backup.setErrorMessage(e.getMessage());
             backup.setCompletedAt(LocalDateTime.now());
@@ -137,7 +153,8 @@ public class BackupService {
         }
     }
 
-    private void collectOriginStorage(OriginStorageConfig config, String workDir) throws IOException {
+    private void collectOriginStorage(OriginStorageConfig config, String workDir,
+                                       Long backupId, LocalDateTime lastBackupTime) throws IOException {
         String type = config.getType() != null ? config.getType().toUpperCase() : "S3";
         Path storageDir = Path.of(workDir, "storage");
         Files.createDirectories(storageDir);
@@ -151,17 +168,131 @@ public class BackupService {
             if (!source.exists()) {
                 throw new BackupException("Local storage path does not exist: " + localPath);
             }
-            log.info("Copying local storage from {} to {}", localPath, storageDir);
-            copyDirectory(source, storageDir.toFile());
-            log.info("Local storage files copied successfully");
+
+            String snapshotsBase = getSnapshotsBaseDir();
+            Path snapshotDir = Path.of(snapshotsBase, String.valueOf(backupId));
+            Path prevSnapshot = findPreviousSnapshotDir(snapshotsBase, backupId);
+
+            Files.createDirectories(snapshotDir);
+
+            log.info("Syncing local storage from {} to persistent snapshot {} (previous: {})",
+                    localPath, snapshotDir, prevSnapshot != null ? prevSnapshot : "(none)");
+            try {
+                rsyncWithLinkDest(localPath, snapshotDir.toString(), prevSnapshot);
+            } catch (Exception e) {
+                log.warn("Rsync failed, falling back to full copy: {}", e.getMessage());
+                copyDirectory(source, snapshotDir.toFile());
+            }
+
+            log.info("Creating hardlinks from snapshot {} to workdir {}", snapshotDir, storageDir);
+            try {
+                hardlinkDirectory(snapshotDir, storageDir);
+            } catch (Exception e) {
+                log.warn("Hardlink failed, falling back to file copy: {}", e.getMessage());
+                copyDirectory(snapshotDir.toFile(), storageDir.toFile());
+            }
+
         } else {
-            log.info("Downloading S3 storage from bucket {} to {}", config.getBucketName(), storageDir);
-            var files = s3StorageService.listFiles(config, "");
+            Instant after = lastBackupTime != null
+                    ? lastBackupTime.atZone(ZoneId.systemDefault()).toInstant()
+                    : Instant.EPOCH;
+            log.info("Downloading S3 storage files modified after {} from bucket {}",
+                    after, config.getBucketName());
+            var files = s3StorageService.listFilesAfter(config, "", after);
+            if (files.isEmpty()) {
+                log.info("No new or modified files found since last backup");
+                return;
+            }
             for (String key : files) {
                 Path dest = storageDir.resolve(key.replace("/", "_"));
                 s3StorageService.downloadFile(config, key, dest);
             }
-            log.info("Downloaded {} files from S3 storage", files.size());
+            log.info("Downloaded {} new/modified files from S3 storage", files.size());
+        }
+    }
+
+    private void rsyncWithLinkDest(String source, String destination, Path linkDest)
+            throws IOException, InterruptedException {
+        String src = source.endsWith(File.separator) ? source : source + File.separator;
+        String dest = destination.endsWith(File.separator) ? destination : destination + File.separator;
+
+        List<String> command = new ArrayList<>();
+        command.add("rsync");
+        command.add("-a");
+        command.add("--delete");
+        if (linkDest != null) {
+            command.add("--link-dest=" + linkDest.toString());
+        }
+        command.add(src);
+        command.add(dest);
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            String output = new String(process.getInputStream().readAllBytes());
+            throw new BackupException("rsync failed with exit code " + exitCode + ": " + output);
+        }
+    }
+
+    private String getSnapshotsBaseDir() {
+        if (storageSnapshotsDir != null && !storageSnapshotsDir.isBlank()) {
+            return storageSnapshotsDir;
+        }
+        if ("LOCAL".equalsIgnoreCase(outputType)) {
+            return outputDir + File.separator + SNAPSHOTS_DIR_NAME;
+        }
+        return tempDir + File.separator + SNAPSHOTS_DIR_NAME;
+    }
+
+    private Path findPreviousSnapshotDir(String snapshotsBase, Long currentBackupId) {
+        File base = new File(snapshotsBase);
+        if (!base.exists()) return null;
+
+        File[] dirs = base.listFiles(File::isDirectory);
+        if (dirs == null || dirs.length == 0) return null;
+
+        Long prevId = null;
+        for (File dir : dirs) {
+            try {
+                Long id = Long.parseLong(dir.getName());
+                if (id < currentBackupId && (prevId == null || id > prevId)) {
+                    prevId = id;
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        return prevId != null ? Path.of(snapshotsBase, String.valueOf(prevId)) : null;
+    }
+
+    private void hardlinkDirectory(Path sourceDir, Path destDir) throws IOException {
+        Files.createDirectories(destDir);
+        try (Stream<Path> files = Files.list(sourceDir)) {
+            for (Path file : files.toList()) {
+                Path dest = destDir.resolve(file.getFileName());
+                if (Files.isDirectory(file)) {
+                    hardlinkDirectory(file, dest);
+                } else {
+                    Files.createLink(dest, file);
+                }
+            }
+        }
+    }
+
+    private void cleanupSnapshotDir(Long backupId) {
+        String snapshotsBase = getSnapshotsBaseDir();
+        Path snapshotDir = Path.of(snapshotsBase, String.valueOf(backupId));
+        try {
+            if (Files.exists(snapshotDir)) {
+                try (Stream<Path> files = Files.walk(snapshotDir)) {
+                    files.sorted(Comparator.reverseOrder())
+                            .map(Path::toFile)
+                            .forEach(File::delete);
+                }
+                log.info("Cleaned up snapshot dir for failed backup: {}", snapshotDir);
+            }
+        } catch (Exception e) {
+            log.warn("Could not clean up snapshot dir: {}", snapshotDir, e);
         }
     }
 
@@ -231,13 +362,52 @@ public class BackupService {
         backupRepository.save(backup);
         addHistory(backup.getId(), "RESTORING", BackupStatus.RESTORING, "Starting restore process");
 
+        String restoreDir = tempDir + File.separator + "restore_" + backup.getId();
+        String zipPath = backup.getFilePath();
+        boolean tempZip = false;
+
         try {
-            addHistory(backup.getId(), "RESTORING", BackupStatus.RESTORING, "Restoring database");
-            databaseService.restoreDatabase(request.getDatabase(), backup.getFilePath());
+            Files.createDirectories(Path.of(restoreDir));
+
+            if (zipPath != null && zipPath.startsWith("s3://")) {
+                addHistory(backup.getId(), "DOWNLOADING", BackupStatus.RESTORING,
+                        "Downloading backup from S3");
+                zipPath = restoreDir + File.separator + backup.getFilename();
+                OriginStorageConfig s3Config = buildS3OutputConfig();
+                s3StorageService.downloadFile(s3Config, backup.getFilename(), Path.of(zipPath));
+                tempZip = true;
+            }
+
+            addHistory(backup.getId(), "EXTRACTING", BackupStatus.RESTORING, "Extracting backup archive");
+            zipService.extractZip(zipPath, restoreDir);
+
+            File dumpFile = Path.of(restoreDir, "database_dump.sql").toFile();
+            if (dumpFile.exists()) {
+                addHistory(backup.getId(), "RESTORING_DB", BackupStatus.RESTORING,
+                        "Restoring database");
+                databaseService.restoreDatabase(request.getDatabase(), dumpFile.getAbsolutePath());
+            } else {
+                log.warn("No database dump found in backup archive, skipping database restore");
+            }
+
+            Path storageDir = Path.of(restoreDir, "storage");
+            if (Files.exists(storageDir) && request.getOriginStorage() != null
+                    && "LOCAL".equalsIgnoreCase(request.getOriginStorage().getType())) {
+                String destPath = request.getOriginStorage().getLocalPath();
+                if (destPath != null && !destPath.isBlank()) {
+                    addHistory(backup.getId(), "RESTORING_FILES", BackupStatus.RESTORING,
+                            "Restoring storage files to " + destPath);
+                    File dest = new File(destPath);
+                    copyDirectory(storageDir.toFile(), dest);
+                    log.info("Storage files restored to {}", destPath);
+                }
+            }
 
             backup.setStatus(BackupStatus.RESTORED);
             backupRepository.save(backup);
-            addHistory(backup.getId(), "RESTORED", BackupStatus.RESTORED, "Restore completed successfully");
+            addHistory(backup.getId(), "RESTORED", BackupStatus.RESTORED,
+                    "Restore completed successfully");
+
         } catch (Exception e) {
             log.error("Restore failed: {}", e.getMessage(), e);
             backup.setStatus(BackupStatus.RESTORE_FAILED);
@@ -246,6 +416,11 @@ public class BackupService {
             addHistory(backup.getId(), "RESTORE_FAILED", BackupStatus.RESTORE_FAILED,
                     "Restore failed: " + e.getMessage());
             throw new BackupException("Restore failed: " + e.getMessage(), e);
+        } finally {
+            cleanupTemp(restoreDir);
+            if (tempZip) {
+                cleanupLocalFile(zipPath);
+            }
         }
     }
 
@@ -261,6 +436,8 @@ public class BackupService {
                 log.warn("Could not delete file: {}", path);
             }
         }
+
+        cleanupSnapshotDir(id);
 
         backupRepository.delete(backup);
         addHistory(id, "DELETED", BackupStatus.COMPLETED, "Backup deleted");

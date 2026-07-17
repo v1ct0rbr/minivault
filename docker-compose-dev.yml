@@ -1,0 +1,80 @@
+version: "3.8"
+
+services:
+
+  minivault-db:
+    image: postgres:16-alpine
+    container_name: minivault-db
+    environment:
+      POSTGRES_DB: minivault_db
+      POSTGRES_USER: minivault_user
+      POSTGRES_PASSWORD: minivault_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - minivault-db-data:/var/lib/postgresql/data
+    networks:
+      - minivault-network
+
+  target-db:
+    image: postgres:16-alpine
+    container_name: minivault-target-db
+    environment:
+      POSTGRES_DB: target_db
+      POSTGRES_USER: target_user
+      POSTGRES_PASSWORD: target_pass
+    ports:
+      - "5434:5432"
+    volumes:
+      - target-db-data:/var/lib/postgresql/data
+    networks:
+      - minivault-network
+
+  minivault:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: minivault
+    environment:
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://minivault-db:5432/minivault_db
+      SPRING_DATASOURCE_USERNAME: minivault_user
+      SPRING_DATASOURCE_PASSWORD: minivault_pass
+      BACKUP_API_KEY: dev-api-key
+      OUTPUT_DIR: /app/backups
+      OUTPUT_TEMP_DIR: /app/temp
+      OUTPUT_STORAGE_TYPE: LOCAL
+      BACKUP_SCHEDULE_ENABLED: "true"
+      BACKUP_SCHEDULE_CRON: "0 0 2 * * ?"
+      SCHEDULED_BACKUP_DB_TYPE: postgresql
+      SCHEDULED_BACKUP_DB_HOST: target-db
+      SCHEDULED_BACKUP_DB_PORT: 5432
+      SCHEDULED_BACKUP_DB_NAME: target_db
+      SCHEDULED_BACKUP_DB_USER: target_user
+      SCHEDULED_BACKUP_DB_PASSWORD: target_pass
+      ORIGIN_STORAGE_TYPE: LOCAL
+      ORIGIN_STORAGE_LOCAL_PATH: /data/storage
+      NOTIFICATION_ENABLED: "false"
+      LOG_LEVEL: DEBUG
+    ports:
+      - "8081:8081"
+    volumes:
+      - minivault-backup-data:/app/backups
+      - minivault-backup-temp:/app/temp
+      - web-storage:/data/storage
+    depends_on:
+      - minivault-db
+      - target-db
+    networks:
+      - minivault-network
+
+networks:
+  minivault-network:
+    driver: bridge
+
+volumes:
+  minivault-db-data:
+  target-db-data:
+  minivault-backup-data:
+  minivault-backup-temp:
+  web-storage:

@@ -45,6 +45,9 @@ backup:
     dir: ${OUTPUT_DIR:/tmp/backups}
   temp:
     dir: ${OUTPUT_TEMP_DIR:/tmp/backup-temp}
+  storage:
+    snapshots:
+      dir: ${STORAGE_SNAPSHOTS_DIR:}
 
 notification:
   enabled: ${NOTIFICATION_ENABLED:false}

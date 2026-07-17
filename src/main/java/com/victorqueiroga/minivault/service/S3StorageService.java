@@ -20,6 +20,7 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 import java.io.File;
 import java.net.URI;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -81,6 +82,24 @@ public class S3StorageService {
                     .prefix(prefix)
                     .build());
             return response.contents().stream()
+                    .map(S3Object::key)
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            throw new BackupException("Failed to list files from S3: " + e.getMessage(), e);
+        } finally {
+            client.close();
+        }
+    }
+
+    public List<String> listFilesAfter(OriginStorageConfig config, String prefix, Instant lastModified) {
+        S3Client client = buildClient(config);
+        try {
+            ListObjectsV2Response response = client.listObjectsV2(ListObjectsV2Request.builder()
+                    .bucket(config.getBucketName())
+                    .prefix(prefix)
+                    .build());
+            return response.contents().stream()
+                    .filter(obj -> obj.lastModified() != null && obj.lastModified().isAfter(lastModified))
                     .map(S3Object::key)
                     .collect(Collectors.toList());
         } catch (Exception e) {
